@@ -1,2 +1,2 @@
 # gosqoop
-Herramienta para mover h de una base sql hacia hadoop de forma batchera
+Herramienta para mover datos de una base sql hacia hadoop de forma batchera
