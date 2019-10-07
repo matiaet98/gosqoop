@@ -35,5 +35,9 @@ func checkParallel() {
 "select * from mytable where param = val ##CONDITIONS and param2 = val2"
 			`)
 		}
+	} else {
+		if strings.Contains(global.Query, "##CONDITIONS") {
+			log.Fatalf(`La query especificada solo puede tener la condicion ##CONDITIONS cuando se utiliza el paralelo.`)
+		}
 	}
 }

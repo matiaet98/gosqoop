@@ -1,6 +1,7 @@
 package oracle
 
 import (
+	"context"
 	"database/sql"
 	"encoding/csv"
 	"fmt"
@@ -14,18 +15,19 @@ import (
 	"time"
 )
 
+var CsvFile *os.File
+
 var Db *sql.DB
+var Tx *sql.Tx
 
 // DataToCsv - Obtiene los datos a grabar
 func DataToCsv() {
-	file, err := os.Create(global.Output)
+	CsvFile, err := os.Create(global.Output)
 	if err != nil {
 		log.Fatalln(err.Error())
 	}
-	defer file.Close()
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
-	Db, err = sql.Open("goracle", global.User+"/"+global.Password+"@//"+global.Connstring+"?poolWaitTimeout=0&poolIncrement=5&poolSessionTimeout=0&poolSessionMaxLifetime=36000")
+	defer CsvFile.Close()
+	Db, err = sql.Open("goracle", global.User+"/"+global.Password+"@//"+global.Connstring+"?poolWaitTimeout=0")
 	if err != nil {
 		log.Fatalln(err.Error())
 	}
@@ -39,39 +41,42 @@ func DataToCsv() {
 	}
 	defer rows.Close()
 	columns, _ := rows.ColumnTypes()
-	log.Println("Columnas:")
 	var types []string
 	var colNames []string
 	for x := range columns {
-		fmt.Println(columns[x].Name())
 		colNames = append(colNames, columns[x].Name())
 		types = append(types, columns[x].DatabaseTypeName())
 	}
+	writer := csv.NewWriter(CsvFile)
+	writer.Write(colNames)
+	defer writer.Flush()
 	count := len(columns)
 	values := make([]interface{}, count)
 	valuePtrs := make([]interface{}, count)
 	var finalValues [][]string
-	for rows.Next() {
+	var j int
+	for j = 0; rows.Next(); j++ {
 		for i := range columns {
 			valuePtrs[i] = &values[i]
 		}
 		rows.Scan(valuePtrs...)
 		finalValues = append(finalValues, convert(values, types))
+		if j%global.FetchSize == 0 {
+			writer.WriteAll(finalValues)
+			finalValues = nil
+		}
+		writer.WriteAll(finalValues)
 	}
-	writer.Write(colNames)
-	writer.WriteAll(finalValues)
 }
 
 // DataToCsvParallel - Obtiene los datos a grabar
 func DataToCsvParallel() {
 	var wg sync.WaitGroup
-	file, err := os.Create(global.Output)
+	CsvFile, err := os.Create(global.Output)
 	if err != nil {
 		log.Fatalln(err.Error())
 	}
-	defer file.Close()
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
+	defer CsvFile.Close()
 	Db, err = sql.Open("goracle", global.User+"/"+global.Password+"@//"+global.Connstring+"?poolWaitTimeout=0")
 	if err != nil {
 		log.Fatalln(err.Error())
@@ -80,13 +85,13 @@ func DataToCsvParallel() {
 	if err != nil {
 		log.Fatalln(err.Error())
 	}
+	Tx, _ = Db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	defer Tx.Commit()
 	var max interface{}
 	var min interface{}
 	min, max = getMaxAndMin()
 	colType, nullable := getColType()
 	var queries []string
-	var cols []string
-	var vals [][]string
 	switch colType {
 	case "NUMBER":
 		rmin, _ := strconv.Atoi(string(min.(goracle.Number)))
@@ -103,10 +108,14 @@ func DataToCsvParallel() {
 			queries = append(queries, q)
 		}
 		log.Infoln("Queries a realizar:")
+		cols, types := getCols(global.Query)
+		writer := csv.NewWriter(CsvFile)
+		writer.Write(cols)
+		writer.Flush()
 		for x := range queries {
 			log.Infof("%v\n", queries[x])
 			wg.Add(1)
-			go getValues(queries[x], &wg, &cols, &vals)
+			go getValues(queries[x], &wg, &types)
 		}
 		break
 	case "DATE", "TIMESTAMP":
@@ -115,39 +124,49 @@ func DataToCsvParallel() {
 		log.Fatalln("No se puede paralelizar por esa columna por no ser del tipo correcto (solo se puede por numerico o fecha)")
 	}
 	wg.Wait()
-	writer.Write(cols)
-	writer.WriteAll(vals)
 }
 
-func getValues(query string, wg *sync.WaitGroup, cols *[]string, vals *[][]string) {
-	defer wg.Done()
-	rows, err := Db.Query(query, goracle.FetchRowCount(global.FetchSize), goracle.ArraySize(global.FetchSize))
+func getCols(query string) (cols []string, types []string) {
+	rows, err := Tx.Query(query, goracle.FetchRowCount(1), goracle.ArraySize(1))
 	if err != nil {
 		log.Fatalln(err.Error())
 	}
 	defer rows.Close()
 	columns, _ := rows.ColumnTypes()
-	var types []string
-	if len(*cols) == 0 {
-		for x := range columns {
-			*cols = append(*cols, columns[x].Name())
-			types = append(types, columns[x].DatabaseTypeName())
-		}
-	} else {
-		for x := range columns {
-			types = append(types, columns[x].DatabaseTypeName())
-		}
+	for x := range columns {
+		cols = append(cols, columns[x].Name())
+		types = append(types, columns[x].DatabaseTypeName())
 	}
+	return
+}
+
+func getValues(query string, wg *sync.WaitGroup, types *[]string) {
+	defer wg.Done()
+	writer := csv.NewWriter(CsvFile)
+	defer writer.Flush()
+	var vals [][]string
+	rows, err := Tx.Query(query, goracle.FetchRowCount(global.FetchSize), goracle.ArraySize(global.FetchSize))
+	if err != nil {
+		log.Fatalln(err.Error())
+	}
+	defer rows.Close()
+	columns, _ := rows.ColumnTypes()
 	count := len(columns)
 	values := make([]interface{}, count)
 	valuePtrs := make([]interface{}, count)
-	for rows.Next() {
+	var j int
+	for j = 0; rows.Next(); j++ {
 		for i := range columns {
 			valuePtrs[i] = &values[i]
 		}
 		rows.Scan(valuePtrs...)
-		*vals = append(*vals, convert(values, types))
+		vals = append(vals, convert(values, *types))
+		if j%global.FetchSize == 0 {
+			writer.WriteAll(vals)
+			vals = nil
+		}
 	}
+	writer.WriteAll(vals)
 }
 
 func convert(dest []interface{}, types []string) []string {
@@ -182,8 +201,8 @@ func getMaxAndMin() (min interface{}, max interface{}) {
 	log.Infoln("Obteniendo cotas para columna " + global.Pcolumn)
 	q1 := fmt.Sprintf("select min(t.%s) from (%s) t", global.Pcolumn, global.Query)
 	q2 := fmt.Sprintf("select max(t.%s) from (%s) t", global.Pcolumn, global.Query)
-	_ = Db.QueryRow(q1, goracle.FetchRowCount(1), goracle.ArraySize(1)).Scan(&min)
-	_ = Db.QueryRow(q2, goracle.FetchRowCount(1), goracle.ArraySize(1)).Scan(&max)
+	_ = Tx.QueryRow(q1, goracle.FetchRowCount(1), goracle.ArraySize(1)).Scan(&min)
+	_ = Tx.QueryRow(q2, goracle.FetchRowCount(1), goracle.ArraySize(1)).Scan(&max)
 	log.Infof("Minimo: %v Maximo: %v", min, max)
 	return
 }
@@ -191,7 +210,7 @@ func getMaxAndMin() (min interface{}, max interface{}) {
 func getColType() (string, bool) {
 	log.Infoln("Obteniendo tipo de la columna")
 	q1 := fmt.Sprintf("select t.%s from (%s) t where rownum = 1", global.Pcolumn, global.Query)
-	rows, err := Db.Query(q1, goracle.FetchRowCount(1), goracle.ArraySize(1))
+	rows, err := Tx.Query(q1, goracle.FetchRowCount(1), goracle.ArraySize(1))
 	if err != nil {
 		log.Fatalln(err)
 	}
