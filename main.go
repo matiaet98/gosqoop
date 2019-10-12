@@ -4,7 +4,7 @@ import (
 	"flag"
 	log "github.com/sirupsen/logrus"
 	"gosqoop/global"
-	"gosqoop/readers/oracle"
+	"gosqoop/modules/oracle"
 	"gosqoop/validations"
 	"os"
 	"strconv"
